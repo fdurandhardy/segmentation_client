@@ -1,0 +1,327 @@
+---
+title: "Projet classification : Daboudet, Durand-Hardy, Mareau"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+knitr::opts_chunk$set(error = TRUE, comment = NA)
+library(tidyverse)
+library(plotly)
+library(factoextra)
+library(cluster)
+```
+
+##Traitement de la base de données
+#
+####1) Chargement de la base de données et description
+
+```{r,warning=FALSE}
+VenteEnLigne = read.csv("VenteEnLigne.csv",sep=";",header=TRUE,dec=",")
+```
+<p>InvoiceNo : Code de la facture. Plusieurs produits peuvent avoir le même code de facture s’ils ont été commandé en même temps. Si précédé d’un ‘C’ indique une commande annulée.</p>
+
+<p>StockCode : Référence du produit.</p>
+
+<p>Description : Nom et description du produit commandé. </p>
+
+<p>Quantity : Quantité du produit commandée (en unité). Si variable négative alors commande annulée ou client non-enregistré.</p>
+
+<p>InvoiceDate : Indique la date lorsque la commande a été passée (sous le format jj/mm/aaaa hh :mm). Comprise entre le 1er décembre 2010 et le 9 décembre 2011.</p>
+
+<p>UnitPrice : Prix unitaire du produit (en livre sterling).</p>
+
+<p>CustomerID : Code du client. Les clients non-enregistrés n’ont pas de valeur.</p>
+
+<p>Country : Nom du pays de résidence du client.</p>
+
+#
+####2) Type des variables
+
+<p>Nous avons jugé bon de laisser en facteur les variables InvoiceNo, StockCode, Description et Country. La principale raison est que chacune de ces variables est de type qualitative : les valeurs qu’elles prennent peuvent donc apparaître plusieurs fois d'où l’intérêt d’avoir des facteurs.</p>
+
+<p>Il nous semblait aussi pertinent de transformer la variable InvoiceDate en format date et non plus en chaine de caractere. Nous avons choisi de ne pas tenir compte de l'heure car lors d’une analyse Récence-Fréquence-Montant l’heure n’a que peu d’influence sur la récence.</p>
+
+```{r}
+VenteEnLigne$InvoiceDate=as.Date(VenteEnLigne$InvoiceDate, format = "%d/%m/%Y")
+```
+#
+####3) Selection des clients résidant au Royaume-Uni
+
+```{r}
+VenteEnLigne=VenteEnLigne[VenteEnLigne$Country=="United Kingdom",]
+```
+#
+####4) Données manquantes
+
+```{r}
+summary(VenteEnLigne)
+```
+
+<p>Il n’y a des données manquantes que dans la variable CustomerID. Elles peuvent indiquer des clients non-enregistrés ou des clients n'ayant pas précisé leur numéro lors de leur achat. Nous avons choisi de supprimer ces lignes car le but étant de faire une analyse RFM, si nous n'avons pas d’information sur qui a effectué cet achat, l’analyse sera alors compromise.</p>
+
+```{r}
+VenteEnLigne=na.omit(VenteEnLigne)
+```
+#
+####5) Suppression des commandes annulées
+
+```{r}
+VenteEnLigne = VenteEnLigne[!startsWith(as.character(VenteEnLigne$InvoiceNo), "C"),]
+```
+#
+##Création d'un sous-jeu de données clients
+#
+####6) Jeu de données RFM
+
+<p>Dans cette partie nous avons fait le choix de supposer que nous effectuons cette analyse RFM en janvier 2012. Nous calculons alors la récence par rapport au 01/01/2012. Nous obtenons ici pour chaque client, sa récence, c'est à dire le temps écoulé depuis son dernier achat, sa fréquence, c'est à dire le nombre d'achat effectué durant la période d'étude, et enfin le montant total dépensé au cours de cette même période.</p>
+
+```{r,warning=FALSE}
+set.seed(4)
+ech = sample(1:nrow(VenteEnLigne),2000)
+EchVente = VenteEnLigne[ech,]
+
+EchVente2 = EchVente %>% 
+  group_by(CustomerID) %>% 
+  summarize(Recence=as.integer(as.Date("01/01/2012",format = "%d/%m/%Y")-max(InvoiceDate)),
+            Frequence=n_distinct(InvoiceNo),
+            Montant=sum(Quantity*UnitPrice))
+EchVente2
+```
+#
+##Segmentation du jeu de données clients
+#
+####7) Classification
+
+<p>Nous remarquons la présence d’outliers dans nos données, notamment le client 16029, qui est venu deux fois et a acheté pour plus de £8000. Nous regardons si ce client n’a pas annulé la commande correspondant à £8000 dans les données d’origine. Cette commande n’ayant pas été annulé, nous décidons de conserver ce client.</p>
+
+```{r,echo=FALSE}
+EchVente2[EchVente2$CustomerID=="16029",]
+EchVente[EchVente$CustomerID=="16029",]
+```
+
+<p>Afin d'éviter d'avoir des résultats qui dépendent de l'unité nous avons décidé de standardiser les données, c'est à dire centrer-réduire. Nous aurons de cette manière des groupes plus homogènes.</p>
+
+```{r,echo=FALSE}
+EchVente2 = EchVente2 %>% select(-1)
+
+Moyenne = EchVente2 %>% summarise_all(funs(mean))
+
+MAD=data.frame(Recence=sum(abs(EchVente2$Recence-Moyenne$Recence)^2)/1158,
+               Frequence=sum(abs(EchVente2$Frequence-Moyenne$Frequence)^2)/1158,
+               Montant=sum(abs(EchVente2$Montant-Moyenne$Montant)^2)/1158)
+
+EchVente3 = EchVente2 %>% transmute(Recence = (Recence-Moyenne$Recence)/MAD$Recence,
+                                    Frequence = (Frequence-Moyenne$Frequence)/MAD$Frequence,
+                                    Montant = (Montant-Moyenne$Montant)/MAD$Montant)
+EchVente3
+```
+
+<br><strong>Classification ascendante hiérarchique</strong></br>
+
+<p>Dans un premier temps, nous effectuons une classification non supervisée ascendante hiérarchique. Nous devons donc calculer une matrice de dissimilarité entre les individus. Nous construisons en particulier une matrice de distance car nos données sont numériques. Se pose alors la question de quelle distance utiliser...
+La distance de Manhattan n’est pas intéressante pour nos données. C’est une distance que l’on utilise pour des parcours dans une ville par exemple. Ici nous voulons mesurer la distance directe, un chemin droit. Nous préférons utiliser la distance euclidienne, la distance la plus populaire, plutôt que la distance de Canberra.</p>
+
+<p>Il nous reste le choix de distance ultramétrique, c’est à dire la distance entre groupe : distance du saut minimal, du saut maximal ou de Ward². La distance du saut minimal donnerait des classes longues et sinueuses, alors que le saut maximal donnerait des groupes compacts. Nous avons fini par choisir la distance de Ward au carré, qui utilise les barycentres des groupes à chaque étape et donnera des groupes sphériques et de tailles proches. C’est le critère le plus utilisé, cependant il est sensible à la présence d’outliers, ce qui peut poser problème dans notre cas. Nous verrons plus tard comment nous l'avons corrigé.</p>
+
+```{r,echo=FALSE}
+d = dist(EchVente3,method = "euclidean")
+cah = hclust(d,method="ward.D2")
+plot(rev(cah$height)[1:20],type="b", ylab="Inertie intra",xlab="Nombre k de groupes")
+```
+
+<p>La CAH a construit des partitions emboîtées. Il faut décider maintenant quelle est la meilleure partition. On cherche le premier grand saut dans l’inertie intra. Nous choisirons alors le nombre k qui précède ce saut. C’est la méthode du coude. Un premier saut est observé de 3 à 4. Le choix de 4 groupes lors de la classification nous semble alors pertinent. Nous allons visualiser les groupes obtenus à l'aide de graphiques afin d'avoir une idée de la répartition des individus dans les différentes classes.</p>
+
+```{r,echo=FALSE,,warning=FALSE}
+gpe = cutree(cah,k=4)
+couleur=c("black","#FF0000","#339900","#0000FF")
+
+ggplot(EchVente2)+geom_point(aes(x=Frequence,y=Recence,col=as.factor(gpe)))+ggtitle("Récence en fonction de la fréquence")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Frequence,col=as.factor(gpe))+geom_point()+ggtitle("Fréquence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Frequence,col=as.factor(gpe))+geom_point()+xlim(0,500)+ylim(0,10)+ggtitle("Zoom : Fréquence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Recence,col=as.factor(gpe))+geom_point()+ggtitle("Récence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Recence,col=as.factor(gpe))+geom_point()+xlim(0,1250)+ggtitle("Zoom : Récence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+```
+
+<p>Nous retrouvons donc les 4 groupes. Cependant, nous remarquons que le groupe n°4 n'est formé que d’un seul individu, le client 17841. Ce client se démarque des autres par sa très forte fréquence (presque le double de la seconde fréquence la plus forte). Dû à sa forte fréquence, sa récence est relativement basse et le montant dépensé plutôt élevé. Cette classe composée d'un unique individu ne parait pas très intéressante. Nous avons donc décidé de tester un autre algorithme de classification : la méthode des k-means. Il est toutefois intéressant de noter que la fréquence est la variable par rapport à laquelle nous visualisons le mieux la différenciation entre les différents groupes. La récence semble assez bien expliquer les différentes classes elle aussi : les valeurs prises de la récence des différents groupes sont chacunes dans un intervalle possible d'amplitude différente.</p>
+
+<br><strong>Partitionnement autour des centres mobiles : K-means</strong></br>
+
+<p>Nous décidons d’effectuer un partitionnement autour de centres mobiles. A l’inverse de la CAH, cette méthode va remettre en cause les partitions à chaque étape. Nous devons cependant décider du nombre k de classe dès le début de l’algorithme, ainsi que les centres de ces classes. Plus précisément, pour la méthode des k-means, à chaque étape les individus sont affectés au groupe du centre le plus proche, et nous recalculons les barycentres après chacune de ses affectations. Nous répétons ces étapes jusqu’à remplir un critère d’arrêt. Le but est de maximiser l’inertie inter-classes, mais en parallèle minimiser l’inertie intra-classes. Cela correspond à des groupes bien séparés et compacts.</p>
+
+<p>Pour éviter une convergence vers un minimum local de l’inertie intra, nous devons faire tourner l’algorithme plusieurs fois avec des initialisations de centres différents. Cependant le choix de k reste un problème. Nous allons donc essayer de choisir le meilleur nombre de groupe k par le critère du coude comme nous avons effectué pour la méthode du CAH ci-dessus, c’est à dire celui qui entraîne une forte augmentation de l’inertie intra.</p>
+
+```{r,echo=FALSE}
+km = sapply(1:15,FUN=function(k){kmeans(as.data.frame(EchVente3),k,nstart=50)$tot.withinss})
+plot(km,type="b", ylab="Inertie intra",xlab="Nombre k de groupes")
+```
+
+<p>Nous avons du mal à identifier un saut important dans l'inertie intra-groupe. Peut-être que quatre groupe semblerait judicieux. De plus cet algorithme est aussi très sensible à la présence d’outliers. Nous décidons donc tout de suite d'effectuer une classification mixte.</p> 
+
+<br><strong>Classification mixte</strong></br>
+
+<p>La classification mixte va nous permettre de conserver les avantages de chacune des deux méthodes sans les inconvénients. Cela va nous permettre de consolider les résultats de la CAH. Nous choisissons le nombre de groupe choisi à l’aide de l'inertie intra-classe de la classification ascendante hiérarchique. Nous effectuons maintenant un k-means en prenant en initialisation le nombre de groupe choisi, c'est à dire quatre, et les centres de gravités obtenus à l’issue de la CAH.</p>
+
+```{r,echo=FALSE}
+centre=as.data.frame(EchVente3)
+centre$groupe=gpe
+centres = centre %>% group_by(groupe) %>% summarize(Recence=mean(Recence),Frequence=mean(Frequence),Montant=mean(Montant))
+matrice_centres = centres %>% select(-1) %>% as.matrix()
+```
+
+```{r,echo=FALSE,warning=FALSE}
+mixte=kmeans(as.data.frame(EchVente3),4,centers=matrice_centres)
+cluster=mixte$cluster
+
+couleur=c("black","#FF0000","#339900","#0000FF")
+
+ggplot(EchVente2)+geom_point(aes(x=Frequence,y=Recence,col=as.factor(cluster)))+ggtitle("Récence en fonction de la fréquence")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Frequence,col=as.factor(cluster))+geom_point()+ggtitle("Fréquence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Frequence,col=as.factor(cluster))+geom_point()+xlim(0,500)+ylim(0,10)+ggtitle("Zoom : Fréquence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Recence,col=as.factor(cluster))+geom_point()+ggtitle("Récence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Recence,col=as.factor(cluster))+geom_point()+xlim(0,1250)+ggtitle("Zoom : Récence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+```
+
+<p>Nous obtenons un résultat semblant totalement identique à celui de la classification ascendante hiérarchique. Le groupe n°4 est encore une fois formé que d'un seul individu : le client 17841. Nous décidons donc d'utiliser une autre méthode qui est plus robuste en présence d'outlier, une variante de cet algorithme.</p>
+
+<br><strong>Partitionnement autour des centres mobiles : algorithme “Partitioning Around Meloïds”</strong></br>
+
+<p>L’algorithme des k-means reste très sensible à la présence de valeurs extrêmes malgré l'utilisation d'une classification mixte. L’algorithme “Partitioning Around Meloïds” utilise une notion plus robuste de la notion de centre, ce qui va lui permettre d’être moins sensible aux outliers. Les centres de classes sont des individus et non plus des barycentres. En plus du k-mean, il va à chaque étape permuter le centre de classe et un individu si le coût du remplacement est négatif. Dû à la présence d’outliers, nous préférons finalement utiliser cette approche, malgré un coût plus élevé. Nous effectuons donc une classification PAM avec quatre groupes, ce nombre choisi par la méthode du CAH.</p>
+
+```{r,echo=FALSE,warning=FALSE}
+pam=pam(as.data.frame(EchVente3),k = 4,FALSE,metric = "euclidean")
+
+couleur=c("black","#FF0000","#339900","#0000FF")
+
+ggplot(EchVente2)+geom_point(aes(x=Frequence,y=Recence,col=as.factor(pam$clustering)))+ggtitle("Récence en fonction de la fréquence")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Frequence,col=as.factor(pam$clustering))+geom_point()+ggtitle("Fréquence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Frequence,col=as.factor(pam$clustering))+geom_point()+xlim(0,1250)+ylim(0,10)+ggtitle("Zoom : Fréquence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Recence,col=as.factor(pam$clustering))+geom_point()+ggtitle("Récence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+
+ggplot(EchVente2)+aes(x=Montant,y=Recence,col=as.factor(pam$clustering))+geom_point()+xlim(0,1250)+ggtitle("Zoom : Récence en fonction du montant")+scale_color_manual(values=couleur,name="Groupes")
+```
+
+<p>Le résultat est différent de chacune des méthodes que nous avons appliqué auparavant, des méthodes sensibles aux outliers.Il n'y a plus de groupes formés de peu de valeurs, formés d'outliers. Nous avons bien 4 groupes distincts assez homogènes. C'est bien ce dernier résulat que nous décidons de conserver dû à sa robustesse aux outliers.</p>
+
+#
+####8) Interprétation 
+
+<p>Nous cherchons maintenant à interpréter nos résultats finaux. Pour cela nous décidons d’effectuer une analyse en composante principale. Voici ce que nous obtenons :</p>
+
+```{r,echo=FALSE}
+acp = princomp(EchVente2,cor=T,scores=T)
+par(mfrow=c(1,2))
+biplot(acp,xlab="Première composante",ylab="Deuxième composante")
+plot(acp$scores[,1],acp$scores[,2],type="n",xlim=c(-4,2),ylim=c(-2,4),xlab="Premier axe",ylab="Deuxième axe")
+text(acp$scores[,1],acp$scores[,2],col=pam$clustering,cex=2,labels='.')
+```
+
+<strong>Inertie expliquée par les axes</strong>
+```{r,echo=FALSE}
+x = get_eigenvalue(acp)
+colnames(x) = c("Valeurs Propres","Variance (en %)","Variance cumulee (en %)")
+x
+```
+
+<strong>Coordonnées de chaque variable sur les axes</strong>
+```{r,echo=FALSE}
+coord =  get_pca_var(acp)
+as.data.frame(coord$coord)
+```
+
+<strong>Contribution de chaque variable à la constuction des axes</strong>
+```{r,echo=FALSE}
+as.data.frame(round(coord$contrib,3))
+```
+
+<p>Tout d'abord, nous voyons que l'information apportée par les deux premiers axes principaux est suffisante (75% de l'information).</p>
+
+<p>Le premier axe est formé principalement grâce aux deux variables Fréquence et Récence. La variable Montant a très peu contribué à sa formation. Toutefois, on remarque que la coordonnée de la Récence avec le premier axe est positive alors que celle de Fréquence est négative. Ce qui veut dire que si un client vient souvent et que la dernière fois qu'il est venu est assez récente, il aura tendance à prendre une valeur négative sur cet axe. Au contraire, un individu qui ne vient pas souvent ayant une récence forte prendra une valeur positive sur celui-ci. Comme les données que nous avons se répartissent sur une durée assez courte d'environ un an, il est assez évident qu'un client qui est venu souvent (fréquence élevée) est aussi venu plus récemment (Recence faible) ce qui n'est habituellement pas le cas.</p>
+
+<p>Concernant le second axe, la contribution de la fréquence sur cet axe est nulle et celle de la récence très faible par rapport à la contribution du montant. De plus, les coordonnées de ces deux variables significatives sur cet axe est positive. On peut donc interpréter cet axe de la manière suivante : les individus qui prennent une valeur négative sur cet axe seront les individus n'ayant pas beaucoup dépensé mais qui sont revenus récemment alors que les individus prenant une valeur positive seront les individus ayant beaucoup dépensé mais dont la dernière venue n'est pas si récente. On aurait donc les flambeurs à droite et les clients plus économes à gauche.</p>
+
+<p>Maintenant ces deux axes interprétés, regardons où se situent les individus suivant ces deux axes. Comme nous l'avons déjà fait remarqué précédemment, la fréquence est la principale différentiation entre les axes. Cela se vérifie sur l'acp les individus se répartissent de façon très homogène sur le premier axe. A priori, le montant ne semble pas déterminant pour le choix des groupes cas les individus ont tendance à varier beaucoup sur le second axe principal, quelque soit leur groupe d'appartenance. Nous verrons pourtant par la suite que le montant intervient lui aussi dans la classification significativement : les médianes du montant entre chaque groupe sont complètement différentes.</p>
+
+<p>- Le groupe rouge serait donc composé principalement d'individus ayant une faible fréquence mais une forte récence.
+- Le groupe vert serait caractérisé de manière générale d'une fréquence faible mais légérement plus élevé que le premier groupe ainsi qu'une récence un peu moins élevé que le groupe précédent mais restant forte.
+- De la même manière, le groupe bleu a une grande fréquence et une plus faible récence.
+- Le groupe noir quant à lui aurait une très grande fréquence et une récence encore plus faible.</p>
+
+<p>On remarque de plus que la récence des groupes devient de moins en moins hétérogène.</p>
+
+<p>Nous allons maintenant nous intéresser un peu plus aux particularités de chaque groupe et essayer de caractériser chacun d'entre eux. Pour cela, nous observons quelques statistiques descriptives :</p>
+
+```{r,echo=FALSE,warning=FALSE}
+EchVente2$groupe = pam$clustering
+
+summarize = EchVente2 %>% group_by(groupe) %>% summarise(median(Recence),
+                                                         median(Frequence),
+                                                         median(Montant),
+                                                         nombre = n(),
+                                                         pourcentage = n()/1158*100)
+summarize$groupe = c("Noir","Rouge","Vert","Bleu")
+summarize
+
+summarize = EchVente2 %>% group_by(groupe) %>% summarise(min(Frequence),
+                                                        max(Frequence))
+
+summarize$groupe = c("Noir","Rouge","Vert","Bleu")
+summarize
+
+summarize = EchVente2 %>% group_by(groupe) %>% summarise(min(Recence),
+                                                         max(Recence))
+
+summarize$groupe = c("Noir","Rouge","Vert","Bleu")
+summarize
+
+summarize = EchVente2 %>% 
+  filter(Montant>200,groupe) %>% 
+  group_by(groupe) %>% 
+  summarise('Montant>200' = n()) %>%
+  inner_join(EchVente2 %>%
+               select(Montant,groupe) %>%
+               group_by(groupe) %>%
+               summarise(min(Montant),max(Montant)),by = 'groupe')
+
+summarize$groupe = c("Noir","Rouge","Vert","Bleu")
+summarize
+```
+
+<p>Nous allons regarder les particularités de chacun des groupes en examinant graduellement la variable qui semble la plus déterminante : la fréquence.</p>
+
+<p>Le premier graphique, "Récence en fonction de la fréquence" nous indique que les individus constituant le groupe rouge sont les clients qui ont passé le moins souvent de commandes en ligne. Tous les individus constituant ce groupe ne sont venus qu'une seule fois passer commande à l'entreprise. C'est le groupe le plus important (831 individus) et il représente tout de même plus de 70% de l'échantillon. C'est aussi dans ce groupe que les montants dépensés sont les moins élevés : le montant médian est de £13.5, presque la moitié du montant médian du second groupe ayant le moins dépensé. Enfin, la récence médiane de ce groupe est la plus élevée parmi toutes les classes. Nous pouvons donc considérer cette classe comme le groupe des clients venant une fois faire des achats particuliers, peut etre plus pour l'achat d'un article précis que par réelle attirance envers l'entreprise anglo-saxonne. Comme nous l'avons fait remarquer précédemment, la durée d'analyse est assez courte (seulement une année) donc il est probable que certains client de ce groupe soient déjà venus mais que cela remonte à plus d'une année, ce qui ne change rien à notre analyse. Les individus appartenant à cette classe pourraient être caractérisés comme étant des "clients surprise".</p>
+
+<p>La seconde classe sur laquelle nous allons nous pencher est le groupe vert. cette classe est constituée de 209 individus soit environ 18% de l'ensemble des clients. De même que pour la classe 2, tous les individus de ce groupe ont passé exactement 2 commandes dans cette entreprise. Les sommes dépensées sont plus importantes (montant médian de £26). Il est toutefois intéressant de noter que les deux clients ayant le plus dépensé (client 16029 d'un montant de £8307 et client 17450 avec £1188) font parties de cette classe. La récence médiane a pour le coup énormément diminué par rapport au groupe rouge précédent : elle est passée de 149 jours à 82. Ce groupe semble donc être constitué de client étant déjà venus acheter des articles sur le site de l'entreprise une première fois, ont été satisfaits, et sont revenus passer commande une seconde fois. On pourrait qualifier ces clients comme étant des "habitués potentiels".</p>
+
+<p>Le troisième groupe auquel nous nous intéressons est la classe bleue. Cette classe est constituée de 94 individus donc un groupe assez restreint. Les particularités de ce groupe sont assez similaires à celles de la classe verte mais de manière plus significatives : les individus de ce groupe ont tendance à dépenser encore plus que ceux du groupe vert avec un montant médian égal à £37. Ils auraient tendance à venir plus fréquemment, entre 3 et 4 fois, et leurs derniers achats seraient plus récents avec une récence médiane de 59 jours. Les individus de cette classe seront donc des clients habitués qui sont pleinement satisfait de l'efficacité de l'entreprise anglo-saxonne. On pourrait les qualifier de "habitués confirmés".</p>
+
+<p>Enfin arrive la dernière classe qui est le groupe noir. Ce groupe est moins homogène que les trois précédents et est composé de beaucoup moins d'individus : seulement 24. Tous les clients de cette classe sont venus au moins 5 fois donc semblent être des clients réguliers. Toutefois, les fréquences sont beaucoup plus disparates que dans les autres groupes : elles varient entre 5 et 36 fois. Ces fréquences restent très élevées par rapport à celles des autres groupes. La récence médiane est aussi la plus faible de tous les groupes : de seulement 41.5 jours. Comme les individus reviennent régulièrement les sommes dépensées sont plus importantes. Ce groupe regroupe donc les clients qui auraient tendance à favoriser cette entreprise par rapport à d'autres. On pourrait qualifier cette classe de "habitués réguliers".</p>
+
+#Remarque
+#
+<p>Nous tenons à faire remarquer que si nous ne standardisons pas nos données, les résultats obtenus lors de la classification sont totalement différents, quelque soit la méthode utilisée. C'est, dans ce cas, la variable "Récence" qui explique le plus la séparation de nos données en groupe. La méthode CAH nous amène à choisir trois groupes. Voilà le résultat de la classification que nous avons obtenus, avec la même démarche ci dessus, par l'utilisation de l'algorithme PAM : </p>
+
+```{r,echo=FALSE,warning=FALSE}
+pam=pam(EchVente2,3,FALSE,"euclidean")
+
+couleur=c("#339900","#FF0000","#FF9900")
+
+ggplot(EchVente2)+geom_point(aes(x=Frequence,y=Recence,col=as.factor(pam$clustering)))+scale_color_manual(values=couleur,name="Groupes")+ggtitle("Récence en fonction de la fréquence")
+
+ggplot(EchVente2)+aes(x=Montant,y=Frequence,col=as.factor(pam$clustering))+geom_point()+xlim(0,500)+ylim(0,10)+scale_color_manual(values=couleur,name="Groupes")+ggtitle("Zoom : Fréquence en fonction du montant")
+
+ggplot(EchVente2)+aes(x=Montant,y=Recence,col=as.factor(pam$clustering))+geom_point()+xlim(0,1250)+scale_color_manual(values=couleur,name="Groupes")+ggtitle("Zoom : Récence en fonction du montant")
+```
+
